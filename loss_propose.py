@@ -80,12 +80,12 @@ class InterClassLoss(nn.Module):
         
         # 获取每个样本对应的正确类别中心
         centers_batch = self.centers[labels]
-        mask = labels.equal(labels.T) #whether it belong to one class or not 
+        mask = labels.eq(labels.T) #whether it belong to one class or not 
         
         # 计算正确距离
         correct_distances = self.cosine_distance(features, centers_batch, dim=1)#torch.norm(features - centers_batch, dim=1)
         diff = centers_batch - features
-        unique_labels, unique_indices = torch.unique(labels, return_inverse=True) #find out the unqie label within dataset: delete the repeat samples
+        unique_labels, counts = torch.unique(labels, return_counts=True, sorted=True) #find out the unqie label within dataset: delete the repeat samples
         #unique label and unique index in the new labels it output from the unqie label
         #unique indices are the index of the which label
         expanded_centers = self.centers.expand(features.size()[0], -1, -1) # for all batch
@@ -93,67 +93,55 @@ class InterClassLoss(nn.Module):
         distance_centers =self.cosine_distance(expanded_feature - expanded_centers).sum(dim=-1) #distace for each centers as for each embeddings
         #sum up trough each chanels
         #right_distance = diff.pow(2).reshape(-1,1)#.sum(dim=-1) #distace for right centers
-        intra_dis = correct_distances/(distance_centers-correct_distances) #without the right one
+        correct_distances = mask * distance_centers 
+        inter_dis = correct_distances/(distance_centers-correct_distances) #without the right one
+        correct_distances = correct_distances.sum(dim=1)/counts #get all the distance for each classification
+        centers_batch = self.centers.index_select(dim=0, index=labels)#.long()) ensure each center for each batch data
+        criterion = nn.MSELoss()
+        center_loss = criterion(features, centers_batch)
         #for different class 
-        add_distance = (distance_centers-).sum
         #minimize this part to decrease the distance between the right one
 
-        '''
-        
-        difference = torch.zeros_like(self.centers)
-        for i in unique_labels:
-            mask = (labels == i) 
-            difference[i] += torch.sum(diff[mask],dim=0)        
-        # 计算错误距离 (平均错误类别的距离)
-        incorrect_distances = torch.zeros(batch_size, device=features.device)
-        for i in range(num_classes):
-            if i != labels:
-                dist_to_other_centers = torch.norm(features - self.centers[i], dim=1)
-                incorrect_distances += dist_to_other_centers
-        
-        incorrect_distances = incorrect_distances / (num_classes - 1)
-        '''
-        
         # 计算比值损失 (L_ratio)
         #ratio_loss = correct_distances / incorrect_distances
         
         # 平均化损失
-        loss_ratio = intra_dis.mean()
-        for i in unique_labels:
-            mask = (labels == i) #index for the centers difference within the vector
-            intra_difference[i] += torch.sum(diff[mask],dim=0)
-            inter_difference[i] += distance_center torch.sum(diff[mask],dim=)
+        loss_ratio = inter_dis.mean()
             #difference[i] += diff[j]
         # 计算类内损失 (L_intra)
         intra_class_loss = 0
-        for i in range(num_classes):
-            class_mask = (labels == i)
-            if class_mask.sum() > 1:  # 至少需要两个样本才能计算类内距离
-                class_features = features[class_mask]
-                pairwise_distances = torch.norm(class_features.unsqueeze(1) - class_features.unsqueeze(0), dim=2)
-                intra_class_loss += pairwise_distances.sum() / (class_mask.sum() * (class_mask.sum() - 1))
         
         # 总损失
-        total_loss = loss_ratio.mean() + self.lambda_intra * intra_class_loss
+        total_loss = loss_ratio.mean() + self.lambda_intra * intra_class_loss + center_loss
         return total_loss
     
     def update_centers(self, features, labels, lr=0.05):
         """
         根据损失函数的梯度信息来更新类别中心，同时考虑类内距离。
         """
+        features = features.transpose(1,2)
+        features = features.reshape(-1,features.size()[-1])
         batch_size = features.size(0)
         
         # 获取每个样本对应的正确类别中心
         centers_batch = self.centers[labels]
         
         # 计算梯度并更新中心
-        for i in range(batch_size):
+        for i in torch.randint(0,batch_size,2):
+        #for i in range(batch_size):
             # 获取当前样本的embedding和其对应的正确类别中心
             x = features[i]
-            center_correct = centers_batch[i]
+            center_correct = centers_batch[labels[i]]
             
             # 计算正确类别中心的更新方向（朝向样本移动）
             grad_correct = (center_correct - x) / torch.norm(center_correct - x)
+            self.centers[i] = self.centers[i] - 2* lr * grad_correct
+
+            grad_correct = (centers_batch - x.repeat(self.centers.size()[5,1])) / torch.norm(center_correct - x.repeat(self.centers.size()[5,1]) )
+            self.centers = self.centers + lr * grad_correct
+        
+        #only use two samples
+
             
             # 对其他类别中心进行更新（远离样本）
             for j in range(self.centers.size(0)):
