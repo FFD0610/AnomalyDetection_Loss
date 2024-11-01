@@ -73,17 +73,22 @@ class InterClassLoss(nn.Module):
     def cosine_distance(self,x1,x2,dim=-1):
         return 1 - F.cosine_similarity(x1, x2, dim=dim)
 
-    def forward(self, features, labels):
+    def forward(self, features, labels, nums=2):
+        #nums: the number of samples used for inter-class calculation
         features = features.transpose(1,2).reshape(-1,features.size()[1])
         batch_size = features.size(0)
         num_classes = self.centers.size(0)
         
         # 获取每个样本对应的正确类别中心
         centers_batch = self.centers[labels]
-        mask = labels.eq(labels.T) #whether it belong to one class or not 
-        
-        # 计算正确距离
         correct_distances = self.cosine_distance(features, centers_batch, dim=1)#torch.norm(features - centers_batch, dim=1)
+
+        #mask = labels.eq(labels.T) #whether it belong to one class or not 
+        select_index = torch.randint(0, features.size()[0], nums) #randomly select for the updated features using the inter-class
+        # 计算正确距离
+        features_s = features[select_index]
+        labels_s = labels[select_index]
+        distance = self.cosine_distance(features, centers_batch.T)        
         diff = centers_batch - features
         unique_labels, counts = torch.unique(labels, return_counts=True, sorted=True) #find out the unqie label within dataset: delete the repeat samples
         #unique label and unique index in the new labels it output from the unqie label
@@ -224,12 +229,120 @@ class IntraDistanceLoss1(nn.Module):
             # 更新正确类别中心，使其靠近当前样本
             self.centers[labels[i]] -= lr * grad_correct
 
+class IntraDistanceLoss(nn.Module):
+    def __init__(self, num_classes, feature_dim, lambda_intra=0.1):
+        super(IntraDistanceLoss, self).__init__()
+        # 初始化类别中心
+        self.centers = nn.Parameter(torch.randn(num_classes, feature_dim))
+        self.lambda_intra = lambda_intra  # 控制类内损失的权重
+        self.alpha = 0.5
+        self.num_classes = num_classes
+
+    def cosine_distance(self, x1, x2, dim=-1):
+        x1 = x1.unsqueeze(1)
+        x2 = x2.unsqueeze(0)
+        return 1 - F.cosine_similarity(x1, x2, dim=dim).mean(-1)
+    
+    def forward(self, features, labels):
+        features = features.transpose(1,2).reshape(-1,features.size()[1])
+        labels = labels.flatten().reshape(-1,1)
+        batch_size = features.size(0)
+        num_classes = self.centers.size(0)
+        
+        # 获取每个样本对应的正确类别中心
+        centers_batch = self.centers[labels].squeeze(1)
+        
+        # 计算正确距离
+        correct_distances =  self.cosine_distance(features, centers_batch, dim=1) #[10,3]
+        #correct_distances =  torch.norm(features - centers_batch, dim=1) #[10,3]
+        
+        # 计算错误距离 (平均错误类别的距离)
+        #incorrect_distances = torch.zeros(batch_size, device=features.device)
+        all_distance = self.cosine_distance(features,self.centers,dim=1)
+        incorrect_distances = all_distance - correct_distances
+
+        incorrect_distances = incorrect_distances / (num_classes - 1)
+        
+        # 计算 ratio 损失
+        #print(correct_distances.size(),incorrect_distances.size())
+        ratio_loss = correct_distances / incorrect_distances
+        
+        # 计算类内聚合损失 (每个样本与其对应类别中心的距离)
+        intra_class_loss = correct_distances.mean()
+        
+        # 总损失 = ratio loss + λ * intra-class loss
+        total_loss = ratio_loss.mean() + self.lambda_intra * intra_class_loss #Hinge Loss=max(0,1−y⋅f(x))
+        
+        return total_loss
+    
+    def update_centers(self, features, labels, nums=2, lr=0.5):
+        """
+        根据损失函数的梯度信息来更新类别中心。
+        """
+        features = features.transpose(1,2).reshape(-1,features.size()[1])
+        labels = labels.flatten() #.reshape(-1,1)
+        batch_size = features.size(0)
+
+        
+        # 获取每个样本对应的正确类别中心
+        centers_batch = self.centers[labels].squeeze(1)
+
+        #centers_batch = self.centers.index_select(dim=0, index=labels)#.long()) ensure each center for each batch data
+        criterion = nn.MSELoss()
+        diff = centers_batch - features
+
+        appear_times = torch.bincount(labels,minlength=self.num_classes)
+        #appear_times = appear_times.unsqueeze(-1).expand_as(centers_batch)
+        #print(appear_times.clamp(min=1))
+
+        unique_labels, unique_indices = torch.unique(labels, return_inverse=True) #find out the unqie label within dataset: delete the repeat samples
+        #unique label and unique index in the new labels it output from the unqie label
+        #unique indices are the index of the which label
+        difference = torch.zeros_like(self.centers)
+        for i in unique_labels:
+            mask = (labels == i) 
+            difference[i] += torch.sum(diff[mask],dim=0)
+        difference /= appear_times.clamp(min=1).unsqueeze(1)
+
+        with torch.no_grad():
+            #self.centers.index_add_(0, label, -self.alpha * diff)
+            self.centers += -self.alpha * difference
+            select_index = torch.randint(0, features.size()[0], (nums,)) #randomly select for the updated features using the inter-class
+        # 计算正确距离
+            features_s = features[select_index]
+            labels_s = labels[select_index]
+            distance = self.cosine_distance(features, centers_batch,dim=1)  #scalar
+        # 计算梯度并更新中心
+            for i in range(batch_size):
+              if i in select_index:
+                # 获取当前样本的embedding和其对应的正确类别中心
+                x = features[i]
+                center_correct = centers_batch[i]
+                
+                # 计算正确类别中心的更新方向（朝向样本移动）
+                grad_correct = (center_correct - x) / torch.norm(center_correct - x)
+                
+                # 对其他类别中心进行更新（远离样本）
+                for j in range(self.centers.size(0)):
+                    #print(labels[i], i, j)
+                    if j != labels[i]:
+                        center_incorrect = self.centers[j]
+                        grad_incorrect = (x - center_incorrect) / torch.norm(x - center_incorrect)
+                        
+                        # 更新错误类别中心，使其远离当前样本
+                        self.centers[j] += lr * grad_incorrect
+                
+                # 更新正确类别中心，使其靠近当前样本
+                #self.centers[labels[i]] -= lr * grad_correct
+        
+
+
 if __name__ == '__main__':
-    x = torch.randn((2,3,5)) #[torch.randn((2,3,5)),torch.randn((2,3,5))]
-    labels =  torch.arange(10).reshape(2,5)#((2)).reshape(-1,1)
+    x = torch.randn((2,3,5)).repeat(5,1,1) #[torch.randn((2,3,5)),torch.randn((2,3,5))]
+    labels =  torch.arange(10).reshape(2,5).repeat(5,1)#((2)).reshape(-1,1)
     model = SeCNN1Donlypropose(5,3,10)
     features, cls = model(x)
-    loss = IntraClassDistanceLoss(num_classes=10,feature_dim=128)
+    loss = IntraDistanceLoss(num_classes=10,feature_dim=128)
     to_loss = loss(features,labels)
     loss.update_centers(features,labels)
     #distance,center_loss, sphere_loss = loss(features,labels)
