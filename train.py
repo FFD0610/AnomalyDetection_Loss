@@ -9,7 +9,7 @@ from torch.utils.data import Dataset, DataLoader
 import torch.nn as nn
 import torch.optim as optim
 import torch.optim.lr_scheduler as lr_scheduler
-from torch.cuda import amp
+import torch.nn.functional as F
 from datasets import ACCORDDataset, TorchDataset
 import time
 from utils import Params, each_class
@@ -17,15 +17,51 @@ import gc
 from losses.center_loss import CenterLoss
 from losses.s_contrastive import  SupConLoss
 from losses.mixed_loss import Mixed_calculation
+from losses.asoftmax import SphereFace
+from losses.soft_contrastive import SoftContra, HardContra
+from losses.auge import Augement
 from networks import *
+'''
+updated:
+1. intro models to verify the loss function ( dlinear + timesnet)
+2. softmax loss revision (check why )
+3. se-based model cannot work for constrative loss based trainin process -> ensure why
+4. center loss not best - revise this one 
 
+'''
+#updated:
+'''
+1. two new contrastive loss function 
+2. center loss with normalized center (self)
+3. pooling layer introduced into the model verification
+'''
+
+#updated 11.14
+'''
+1. use pooling layer for softmax loss and center loss 
+2. More features for learning representation 
+
+'''
+#updated 11.20
+'''
+1. data augementation in softmax loss and center loss 
+2. softmax replaced by asoftmax loss (let it sepearable by introducing the margin)
+3. try other output of the pooling layer
+'''
+#updated in 0203
+'''
+deal with the situation some samples with label but other without 
+the dataset with label should be minimum to the ratio to the number without labels
+so the dataset set with label and without label should be settled before input into the model training process 
+
+'''
 def get_args():
     parser = argparse.ArgumentParser(description='ACCORD data training.')
     parser.add_argument('--cfg', type=str, default='./cfg/accord.yml', help='The path to the configuration file.')
     parser.add_argument('--save-dir', type=str, default='/mnt/database/torch_results/codetesting' , help='The directory of log files.')#./modeltestingsnr50/temtcnv3
     #/mnt/database/results_accord_torch/sekiguchi/timesnet1e5
     parser.add_argument('--name', default='', help='renames results.txt to results_name.txt if supplied') #noiseintro080
-    parser.add_argument('--epochs', type=int, default=2) ################
+    parser.add_argument('--epochs', type=int, default=200) ################
     parser.add_argument('--batch-size', type=int, default=8)
     parser.add_argument('--k', type=int, default=10, help='K-fold cross validation.')
 
@@ -45,11 +81,14 @@ def train(**kwargs):
     maxi = kwargs.get('maxi', None)
     mini = kwargs.get('mini', None)
     noise_intro = kwargs.get('noise_intro',True)
+    loss_s_m  = kwargs.get('loss_s_m',None)
     loss_m = kwargs.get('loss_m',None)
+    eval_pooling = kwargs.get('eval_pooling',False)
+    pooling = kwargs.get('pooling', None)
     print(device)
     if not os.path.exists(result_dir):
         os.makedirs(result_dir)
-
+    print(result_dir)
     # scheduler
     #scheduler = StepLR(optimizer, step_size=1, gamma=gamma)
   
@@ -61,35 +100,56 @@ def train(**kwargs):
         model = SaCNN1Donly(time_steps=time_steps, channels=channels, classes = len(fault_flags), pos=2)
 
     elif m == 'dlinear':
-        model = DLinear(time_steps=time_steps, channels=channels, classes = len(fault_flags))
+        model = DLinear(time_steps=time_steps, channels=channels, classes = len(fault_flags) )
         feat_dim = 20
+        if loss_m == 'mixed' or ( 'soft' or 'hard' ) in loss_m or 'aug' in loss_m :
+            return 0, 0, 0, 0
 
     elif m == 'timesnet':
-        model = TimesNet(time_steps=time_steps, channels=channels, classes = len(fault_flags))
+        model = TimesNet(time_steps=time_steps, channels=channels, classes = len(fault_flags) )
         feat_dim = 32
+
+        if loss_m == 'mixed' or ( 'soft' or 'hard' ) in loss_m or 'aug' in loss_m:
+            return 0, 0, 0, 0
+    
+    elif m == 'conv1d':
+        model = CNN1D(time_steps=time_steps, channels=channels, classes = len(fault_flags))
+        feat_dim  = 128
 
     elif 'mix' in m:
         if 'all' in m :
-            model = MixedNet(time_steps=time_steps,channels=channels, classes = len(fault_flags))
+            model = MixedNet(time_steps=time_steps,channels=channels, classes = len(fault_flags ))
             feat_dim = 128+32+128
         if 'gru-se' in m:   
-            model = MixedNet2(time_steps=time_steps,channels=channels, classes = len(fault_flags))
+            model = MixedNet2(time_steps=time_steps,channels=channels, classes = len(fault_flags)  )
             feat_dim = 128+128
         if 'tcn-se' in m:
-            model = MixedNet3(time_steps=time_steps,channels=channels, classes = len(fault_flags))
+            model = MixedNet3(time_steps=time_steps,channels=channels, classes = len(fault_flags) )
             feat_dim = 128+32
         else: 
-            model = TSEncoder(time_steps=time_steps,channels=channels, classes = len(fault_flags))
+            model = TSEncoder(time_steps=time_steps,channels=channels, classes = len(fault_flags) )
             feat_dim = 128+32
+    
+    elif m == 'tcn':
+        model = TCN(time_steps=time_steps,channels=channels, classes = len(fault_flags)  )
+        feat_dim = 64
 
     model = model.to(device)
     #feat_dim = 128 if 'mix' not in m else feat_dim
 
+
+
     #loss definition
+    if  'sphere' in loss_m:
+        loss_cls = SphereFace(feat_dim, subj_num=len(fault_flags))
+    
     loss_s = nn.CrossEntropyLoss().to(device)
-    if loss_m == 'center':
+
+    loss_c = None
+    if 'center' in loss_m:
         loss_c = CenterLoss(feat_dim=feat_dim, classes=len(fault_flags))
         optimizer_center = optim.Adam(loss_c.parameters(), lr=0.001)
+
     elif loss_m == 'contrastive':
         loss_c = SupConLoss(contrast_mode='one')
 
@@ -99,6 +159,18 @@ def train(**kwargs):
     elif loss_m == 'mixed':
         loss_c = Mixed_calculation()
     
+    elif 'soft' in loss_m and 'softmax' not in loss_m:
+        loss_c = SoftContra(soft_temporal=True, soft_instance=False)
+    
+    elif 'hard' in loss_m:
+        loss_c = HardContra()
+    
+
+
+    if 'aug' in loss_m:
+        loss_aug = Augement(pooling=pooling)
+    
+
          
     model = model.to(device)
     loss_s = loss_s.to(device)
@@ -125,23 +197,55 @@ def train(**kwargs):
             #label = label.to(device)
             optimizer.zero_grad()
 
+                
+            if 'aug' in loss_m:
+                crop_l, embed_aug , cls_aug, label_aug = loss_aug(data , label, model) #aumented output from the model
+                #already pooling
+
+
             #all of the model have the two output: embedding features and the classification results
-            if 'softmax' not in loss_m:
-                loss_c_score, diff, cls, label = loss_c(data=data, labels=label, model=model)
+            if loss_c is not None:
+                if 'center' in loss_m:
+                    optimizer_center.zero_grad()
+                    loss_c_score, diff, cls, label = loss_c(data=data, labels=label, model=model, pooling=pooling)
+                    loss_c_score = loss_c_score if 'aug' not in loss_m else loss_c_score + loss_c(data=embed_aug, labels=label_aug, model=model, pooling=pooling)[0]
+                else:
+                    loss_c_score, diff, cls, label = loss_c(data=data, labels=label, model=model)
 
             #features, cls = features.to(device), cls.to(device)
-                loss = loss_c_score + loss_s(cls,label)
+                #print(label.size(),cls.size())
+                loss_s_score = loss_s(cls,label) if 'aug' not in loss_m  else loss_s(cls,label) + loss_s(cls_aug,label_aug)
+                loss = loss_c_score + loss_s_score
+                
             else:
-                _, cls = model(data)
+                #softmax in loss_m and might replaced by sphere face 
+
+                embed, cls = model(data)
+
+                #if 'aug' in loss_m:
+                    #crop_l, embed_aug , cls_aug, label_aug = loss_aug(data , label, model)
+
+                if pooling: 
+                    cls = pooling(cls)
+                    embed = pooling(embed)
+                    label = pooling(label)
+                    
                 label = label.type(torch.LongTensor).to(device)
-                loss = loss_s(cls,label)
+                if 'sphere' in loss_m:
+                    loss = loss_s(loss_cls(embed,label),label) if 'aug' not in loss_m  else loss_s(embed,label) + loss_s(embed_aug,label_aug)
+                else:
+                    loss = loss_s(cls,label) if 'aug' not in loss_m  else loss_s(cls,label) + loss_s(cls_aug,label_aug)
+                
+
 
             loss.backward()
             optimizer.step()
-            if loss_m == 'center':
+
+            if 'center' in loss_m:
                 
-                optimizer_center.step()
                 loss_c.update_centers(diff)
+                optimizer_center.step()
+
 
 
             data_train = cls.argmax(dim=1).flatten() if data_train is None else torch.cat([data_train, cls.argmax(dim=1).flatten()])
@@ -175,11 +279,20 @@ def train(**kwargs):
                 if noise_intro:
                     data = data[:,channels:]                    
                 data = ((data- mini) / (maxi-mini)).to(device).float()
-                label = label.type(torch.LongTensor).to(device)
+                
                 features, cls = model(data)
                 features, cls = features.to(device), cls.to(device)
 
-                val_loss = loss_s(cls, label)
+                if pooling:
+                    cls = pooling(cls)
+                    features = pooling(features)
+                    label = pooling(label)
+
+                label = label.type(torch.LongTensor).to(device)
+                if 'sphere' in loss_m:
+                    val_loss = loss_s(features, label)
+                else:
+                    val_loss = loss_s(cls, label)
                 
                 y_pred = cls.argmax(dim=1).flatten() if y_pred is None else torch.cat([y_pred, cls.argmax(dim=1).flatten()])
                 y_true = label.flatten() if y_true is None else torch.cat([y_true, label.flatten()])
@@ -239,6 +352,7 @@ def train(**kwargs):
             count = 0
         
             best_results_path = os.path.join(result_dir, 'best_results.txt')
+            print('update the best results save in {}'.format(best_results_path))
             with open(best_results_path, 'w') as f:
                 f.write('Epoch:{}\n'.format(epoch+1))
                 f.write(para)
@@ -288,20 +402,53 @@ if __name__ == "__main__":
     snr = 50
     channel_snr = None
     noise_type = 'Guassian'
+    pooling_name = 'max' # 'ava' None
+
+
+    
+        
 
     #threshold_data = 0.0##################################
-    fault_flags = [  '12_FLW4_1', '31_GCI'] ##############
+    #fault_flags = [  '12_FLW4_1', '31_GCI'] ##############
     #fault_flags = [ '29_VLVBPS']
     device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
     print(device)
 
+    if pooling_name == 'ava':
+        pooling = nn.AdaptiveAvgPool1d(time_steps//10).to(device)
+    elif pooling_name == 'max':
+        pooling = nn.AdaptiveMaxPool1d(time_steps//10).to(device)
+    else:
+        pooling = None
+
     #m_names = ['seonly0', 'seonly1','seonly2','saonly0','saonly1','saonly2','cnn','lstmonlly'] #'attention'
     #m_names = ['lstmonly', 'seonly2','saonly2','cnn'] #'seonly0','saonly2',
     m_names = ['mix-all','mix-paper','mix-gru-se','mix-tcn-se']#,'dlinear']  #'timesnet' 'dlinear'
-    save_dir = '/mnt/database/torch_results/codetesting' 
-    loss_m_list = ['mixed','center','softmax','contrastive','supervised-contrastive',] #'center'
-    noise_intro=True
+    m_names = ['timesnet' , 'dlinear', 'conv1d']
+    m_names = [ 'conv1d']
+    m_names = ['mix-paper']
+    m_names = ['mix-all','mix-paper','mix-gru-se','mix-tcn-se','tcn','conv1d','seonly', 'dlinear', 'timesnet']#,'dlinear']  #'timesnet' 'dlinear'
+    m_names = ['mix-tcn-se']
+    m_names = ['mix-all','mix-paper','mix-gru-se','tcn','conv1d','seonly', 'dlinear', 'timesnet']#,'dlinear']  #'timesnet' 'dlinear'
+    m_names = ['mix-gru-se','mix-all','mix-paper','tcn','conv1d','seonly', 'dlinear', 'timesnet']#,'dlinear']  #'timesnet' 'dlinear'
+    m_names = ['tcn','conv1d','seonly', 'dlinear', 'timesnet','mix-tcn-se']#
+    m_names = ['tcn','mix-tcn-se','mix-all','mix-paper'] # 'dlinear', 'timesnet',
+    m_names = ['mix-all','mix-paper','mix-gru-se','mix-tcn-se','tcn','conv1d','seonly', 'dlinear', 'timesnet']
+    #m_names = ['mix-gru-se','mix-all','mix-paper']
+    save_dir = '/mnt/database/torch_results/tanaka-try/10cls' #tanaka-try' 
 
+    loss_m_list = ['center-zerograd' , 'softmax','mixed']
+    loss_m_list = ['sphere-softmax']
+    loss_m_list = ['soft-contra','hard-contra']
+    loss_m_list = ['center-normalized','softmax']
+    loss_m_list = ['center-aug-normalizaed','softmax-aug']
+    #loss_m_list = ['sphere-aug','sphere'] #['softmax-aug','center-aug',]
+    #loss_m_list = ['mixed']
+    loss_s_m = None #'sphere'
+    #loss_m_list = ['mixed','center','softmax','contrastive','supervised-contrastive',] #'center'
+
+    noise_intro=True
+    normal_use= True #
     if normal_use:
         fault_flags.append('Normal')
 
@@ -309,7 +456,7 @@ if __name__ == "__main__":
     for time_steps in [50]:#[50, 100, 200, 500,10]: #50, 100, 200, 10 time steps used in the experiments
 
       channels = params.channels
-      f1s, pres, recs, accs = {}, {}, {}, {}      
+      f1s, pres, recs, accs = {}, {}, {}, {}     
       accdataset = ACCORDDataset(data_dir=data_dir, 
                                 fault_flags=fault_flags,
                                 ab_range=ab_range,
@@ -326,23 +473,25 @@ if __name__ == "__main__":
                                 noise_type=noise_type,
                                 load_filelist=load_filelist,
                                 noise_intro=noise_intro,#False, 
-                                normal_increase=True) #False)
+                                normal_increase=True,
+                                ) #False)
       
       #first divide the dataset for k-fold cross validation
       #maxi, mini = torch.tensor(accdataset.maxi.reshape(-1,1)), torch.tensor(accdataset.mini.reshape(-1,1))
 
-      for val in range(2): 
+      for val in range(k): 
         datasets = accdataset.generate_datasets(fault_flags,val)
-        for m in m_names:
-          result_dir = os.path.join(save_dir,str(time_steps), str(val), m)
-          print(result_dir)
-          if not os.path.exists(result_dir):
-            os.makedirs(result_dir)
+        for loss_m in loss_m_list:
+            for m in m_names:
+                result_dir = os.path.join(save_dir,str(time_steps), loss_m, str(val), m)
+                print(result_dir)
+                if not os.path.exists(result_dir):
+                    os.makedirs(result_dir)
 
-          val_filelist = os.path.join(result_dir, 'val_list.txt')
-          with open(val_filelist, 'a') as f:
-            f.write('Val:{}\n'.format(val))
-            f.write(str(datasets['test'])+'\n') #save first
+                val_filelist = os.path.join(result_dir, 'val_list.txt')
+                with open(val_filelist, 'a') as f:
+                    f.write('Val:{}\n'.format(val))
+                    f.write(str(datasets['test'])+'\n') #save first
 
       for val in range(k): #k fold verification experiments
         datasets = accdataset.generate_datasets(fault_flags,val)
@@ -362,6 +511,7 @@ if __name__ == "__main__":
         for loss_m in loss_m_list:
             print(loss_m)
             for m in m_names:
+                print(m)
             
                 result_dir = os.path.join(save_dir,str(time_steps), loss_m, str(val), m)
                 f1, pre, rec, acc = train(m=m,  
@@ -377,26 +527,30 @@ if __name__ == "__main__":
                     maxi=maxi,
                     mini=mini,
                     noise_intro=noise_intro,
-                    loss_m=loss_m)
+                    loss_m=loss_m,
+                    pooling=pooling)
                 
-                if m not in f1s.keys():
-                    f1s[m] = [f1]
-                    pres[m] = [pre]
-                    recs[m] = [rec]
-                    accs[m] = [acc]
+                if loss_m not in f1s.keys() :
+                    for _ in (f1s, pres, recs, accs):
+                        _[loss_m] = {} 
+
+                if m not in f1s[loss_m].keys() :
+                    f1s[loss_m][m] = [f1]
+                    pres[loss_m][m] = [pre]
+                    recs[loss_m][m] = [rec]
+                    accs[loss_m][m] = [acc]
                 else:
-                    f1s[m].append(f1)
-                    pres[m].append(pre)
-                    recs[m].append(rec)
-                    accs[m].append(acc)
+                    f1s[loss_m][m].append(f1)
+                    pres[loss_m][m].append(pre)
+                    recs[loss_m][m].append(rec)
+                    accs[loss_m][m].append(acc)
 
                 if val == k-1:  
                     final_results_path = os.path.join(result_dir, 'final_avg_acc.txt')
                     with open(final_results_path, 'a') as f:
-                        f.write('final f1: {} {}\n '.format(sum(f1s[m])/len(f1s[m]),f1s[m]))
-
-                        f.write('final pre: {} {}\n '.format(sum(pres[m])/len(pres[m]),pres[m]))
-                        f.write('final rec: {} {}\n '.format(sum(recs[m])/len(recs[m]),recs[m]))
-                        f.write('final acc: {} {}\n '.format(sum(accs[m])/len(accs[m]),accs[m]))
+                        f.write('final f1: {} {}\n '.format(sum(f1s[loss_m][m])/len(f1s[loss_m][m]),f1s[loss_m][m]))
+                        f.write('final pre: {} {}\n '.format(sum(pres[loss_m][m])/len(pres[loss_m][m]),pres[loss_m][m]))
+                        f.write('final rec: {} {}\n '.format(sum(recs[loss_m][m])/len(recs[loss_m][m]),recs[loss_m][m]))
+                        f.write('final acc: {} {}\n '.format(sum(accs[loss_m][m])/len(accs[loss_m][m]),accs[loss_m][m]))
 
 
