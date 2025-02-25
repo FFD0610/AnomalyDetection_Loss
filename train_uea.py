@@ -25,6 +25,7 @@ from networks import *
 import shutil
 from torch.utils.data import TensorDataset, DataLoader
 from sklearn.metrics import confusion_matrix 
+import pandas as pd
 '''
 updated:
 1. intro models to verify the loss function ( dlinear + timesnet)
@@ -41,9 +42,12 @@ the dataset with label should be minimum to the ratio to the number without labe
 so the dataset set with label and without label should be settled before input into the model training process 
 
 '''
+#all use the masked dataset only for training 
+#to consider if there is no train sample of 1 class
+
 def each_class(labels,result,fault_flags):
     results = ''
-    matrix = confusion_matrix(labels,result)
+    matrix = confusion_matrix(labels,result, labels=fault_flags)
     batch_sum = matrix.flatten()
     batch_sum = np.sum(batch_sum)
     f1s,pres,recs,accs = [], [], [], []
@@ -245,13 +249,13 @@ def train(**kwargs):
         loss_c = CenterLoss(feat_dim=feat_dim, classes=len(fault_flags))
         optimizer_center = optim.Adam(loss_c.parameters(), lr=0.001)
 
-    elif loss_m == 'contrastive':
+    elif 'contrastive' in loss_m and 'supervised' not in loss_m:
         loss_c = SupConLoss(contrast_mode='one')
 
-    elif loss_m == 'supervised-contrastive':
+    elif 'supervised-contrastive' in loss_m:
         loss_c = SupConLoss(contrast_mode='all')
 
-    elif loss_m == 'mixed':
+    elif 'mixed' in loss_m :
         loss_c = Mixed_calculation()
     
     elif 'soft' in loss_m and 'softmax' not in loss_m:
@@ -286,11 +290,26 @@ def train(**kwargs):
         
         train_start_time = time.time()
         for data, label, masked_label in tqdm(train_loader):
-            #data is composed of the noise-intro and original part
-            if noise_intro: 
-                data = data[:,:channels]
+
+
+        #only use masked dataset for training 
+            valid_indices = ~torch.isnan(masked_label)  # Returns a boolean tensor        
+            # Filter data and labels based on valid indices
+            filtered_data = data[valid_indices]
+            filtered_labels = label[valid_indices]
             label = label.unsqueeze(1)
             masked_label = masked_label.unsqueeze(1)
+            #filtered_embed = aug_embed[valid_indices.squeeze(1).repeat(3)]
+            #filtered_cls = aug_cls[valid_indices.squeeze(1).repeat(3)]
+            #filtered_labels = labels[valid_indices]
+
+            if 'mask' in loss_m and 'design' not in loss_m:
+                label = filtered_labels.unsqueeze(1)
+                data = filtered_data
+                #print('filtered :', label.size(), data.size())
+                if len(label) == 0:
+                    continue
+                
                 #('data size: ',data.size())
             #data = ((data- mini) / (maxi-mini)).float().to(device)
             #label = label.type(torch.LongTensor).to(device)
@@ -317,6 +336,10 @@ def train(**kwargs):
 
             #features, cls = features.to(device), cls.to(device)
                 #print(label.size(),cls.size())
+                if cls.size(-1) != label.size(-1):
+                    #label = label[:,0]
+                    label = label.repeat(1,cls.size(-1))
+                    #cls = nn.AdaptiveMaxPool1d(label.size(-1)).to(device)(cls) #add at 2.22 for change the ratio to .5 for design loss
                 loss_s_score = loss_s(cls,label) if 'aug' not in loss_m  else loss_s(cls,label) + loss_s(cls_aug,label_aug)
                 #loss = loss_c_score.clone() + loss_s_score.clone()
                 loss = loss_c_score + loss_s_score
@@ -327,7 +350,7 @@ def train(**kwargs):
 
                 #if 'aug' in loss_m:
                     #crop_l, embed_aug , cls_aug, label_aug = loss_aug(data , label, model)
-
+                #print('softmax', label.size(),cls.size())
                 if pooling: 
                     cls = pooling(cls)
                     embed = pooling(embed)
@@ -338,7 +361,8 @@ def train(**kwargs):
                     loss = loss_s(loss_cls(embed,label),label) if 'aug' not in loss_m  else loss_s(embed,label) + loss_s(embed_aug,label_aug)
                 else:
                     loss = loss_s(cls,label) if 'aug' not in loss_m  else loss_s(cls,label) + loss_s(cls_aug,label_aug)
-                
+            if len(label) == 0:
+                continue #all batch masked 
             if torch.isnan(loss).any():
                 print(torch.isnan(data).any(), data, label, masked_label)
                 print(torch.isnan(label).any(), torch.isnan(cls).any(), torch.isnan(loss_s_score), torch.isnan(loss_c_score))
@@ -359,20 +383,23 @@ def train(**kwargs):
             acc = (cls.argmax(dim=1) == label).float().mean()
             epoch_accuracy += acc.detach().item() / len(train_loader)
             epoch_loss += loss.detach().item() / len(train_loader)
+            gc.collect()
+            torch.cuda.empty_cache()
         gc.collect()
 
         train_end_time = time.time()
         training_time = train_end_time - train_start_time
         labels_train = labels_train.cpu()
         data_train = data_train.cpu()
-        print(labels_train.size(),data_train.size())
+        #print('training labels and data all: ', labels_train,data_train)
+        #print(fault_flags, ' in training') 
         _, matrix, train_F1, train_pre, train_rec = each_class(labels_train,data_train,fault_flags)
 
         each_cls_path = os.path.join(result_dir, 'train_each.txt')
         with open(each_cls_path, 'a+') as f:
             f.write('Epoch:{}\n'.format(epoch+1))
             f.write(str(_))
-            f.write(str(matrix)+'\n')
+            f.write(repr(matrix)+'\n')
 
         #evaluation 
         with torch.no_grad():
@@ -434,7 +461,7 @@ def train(**kwargs):
             f.write('Epoch:{}\n'.format(epoch+1))
             f.write(para)
             f.write(str(_))
-            f.write(str(matrix)+'\n')
+            f.write(repr(matrix)+'\n')
     
         time_path = os.path.join(result_dir, 'time.txt')
         with open(time_path, 'a+') as f:
@@ -464,7 +491,7 @@ def train(**kwargs):
                 f.write('Epoch:{}\n'.format(epoch+1))
                 f.write(para)
                 f.write(str(_))
-                f.write(str(matrix)+'\n')
+                f.write(repr(matrix)+'\n')
             
             best_model_dir = os.path.join(result_dir, 'best_model')
             if not os.path.exists(best_model_dir):
@@ -560,7 +587,9 @@ if __name__ == "__main__":
     loss_m_list = ['center-zerograd','soft-contra', 'design-maskedonlyforcls-.7','softmax','hard-contra','mixed']
     loss_m_list = [ 'softmax-re', 'design-maskedonlyforcls-.7-real',]
     loss_m_list = [ 'softmax-re', 'design-maskedonlyforcls-.7-real',]
-    loss_m_list = ['mixed-mask'] #only used known information for training using the same rank dataset
+    loss_m_list = ['design-maskedonlyforcls','mixed-mask', 'softmax-mask', 'hard-contra-mask','soft-contra-mask'] #, 'supervised-contrastive-mask'-stop at DuckDuckGeese] #"",'center-zerograd-mask']
+    loss_m_list1 = ['center-zerograd-mask']
+    #only used known information for training using the same rank dataset
     #loss_m_list = ['center-zerograd','soft-contra'] #, 'mixed']
 
     datasetss_name = [
@@ -595,14 +624,21 @@ if __name__ == "__main__":
             'UWaveGestureLibrary',
         ]# overed
 
-    datasetss_name1 = [    
+    datasetss_name1 = [
+
+            #'MotorImagery', outof cuda - after try
+            'NATOPS',
+            'PEMS-SF',
+            'PenDigits',
             'Phoneme',
             'RacketSports',
             'SelfRegulationSCP1',
             'SelfRegulationSCP2',
             'SpokenArabicDigits',
             'StandWalkJump',
-            'UWaveGestureLibrary',]
+            'UWaveGestureLibrary',
+        ]
+    #datasetss_name = ['AtrialFibrillation']
     #loss_m_list = ['sphere-aug','sphere'] #['softmax-aug','center-aug',]
     #loss_m_list = ['mixed']
     loss_s_m = None #'sphere'
@@ -615,7 +651,7 @@ if __name__ == "__main__":
 
     load_filelist = True if os.path.exists(save_dir) else False
 
-    for mask_ratio in [0.3, 0.9, 0.7]:#[50, 100, 200, 500,10]: #50, 100, 200, 10 time steps used in the experiments no use 
+    for mask_ratio in [ 0.3]:# .3 .[50, 100, 200, 500,10]: #50, 100, 200, 10 time steps used in the experiments no use 
 
       channels = params.channels
       f1s, pres, recs, accs = {}, {}, {}, {}     
@@ -640,15 +676,16 @@ if __name__ == "__main__":
 
         
         for loss_m in loss_m_list:
+            loss_m += str(mask_ratio)
             print(loss_m, 'start training')
             if 'mask' in loss_m:
                 #mask_ratio = mask_ratio_set
                 result_dir = os.path.join(save_dir, name)
-                mask_filelist = os.path.join(result_dir, f'mask_{mask_ratio_set}.txt')
+                mask_filelist = os.path.join(result_dir, f'mask_{mask_ratio}.txt')
                 if not os.path.exists(mask_filelist):
-                    if not os.path.exists(os.path.join(result_dir, f'mask_{mask_ratio_set}.txt')) and mask_ratio_set!=0: # and i ==0:
+                    if not os.path.exists(os.path.join(result_dir, f'mask_{mask_ratio}.txt')) and mask_ratio!=0: # and i ==0:
                             
-                        num_mask = int(len(train_data)* mask_ratio_set)
+                        num_mask = int(len(train_data)* mask_ratio)
                         mask_index = torch.randperm(len(train_data))[:num_mask].tolist()
                         with open(mask_filelist, 'w+') as f:
                             f.write(str(mask_index)+'\n') #save first
@@ -656,7 +693,7 @@ if __name__ == "__main__":
                     with open(mask_filelist,'r') as f:
                         line = f.readlines()[-1]
                         mask_index = line.strip('\n').strip(']').strip('[').replace("'",'').replace(" ",'').split(',')
-                        mask_index = [int(_) for _ in mask_index]
+                        mask_index = [int(_) for _ in mask_index] #former version use all labels
             else:
                 mask_ratio=0
                 mask_index=None
@@ -667,8 +704,11 @@ if __name__ == "__main__":
 
             test_loader = load_datasets(test_data, test_labels, device=device, mask_ratio=0, mask_index=None)
             #np.save()
-            fault_flags=np.arange(train_labels.max()+1)
-            print(loss_m)
+            data_info = pd.read_csv('/mnt/database/datasets/UEA/DataDimensions.csv',usecols=range(10))
+
+            fault_flags = np.arange(data_info.loc[data_info['Problem']==name,'NumClasses'].values)
+            #fault_flags=np.arange(train_labels.max()+1) former version
+            print(loss_m, fault_flags)
             for m in m_names:
                 print(m)
                 result_dir = os.path.join(save_dir, name, loss_m, m)
